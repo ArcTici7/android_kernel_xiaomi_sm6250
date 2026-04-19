@@ -1,0 +1,30 @@
+name: miatoll-kernel
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+    - name: Checkout kernel
+      uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: |
+        sudo apt update
+        sudo apt install -y bc bison flex libssl-dev make git python3 clang lld
+
+    - name: Clone clang toolchain
+      run: |
+        git clone --depth=1 https://github.com/llvm/llvm-project clang
+
+    - name: Build kernel
+      run: |
+        export ARCH=arm64
+        export SUBARCH=arm64
+        export PATH=$PWD/clang/bin:$PATH
+
+        make O=out ARCH=arm64 miatoll_defconfig
+        make -j$(nproc) O=out ARCH=arm64 CC=clang LD=ld.lld
