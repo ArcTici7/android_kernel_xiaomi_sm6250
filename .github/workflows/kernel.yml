@@ -1,4 +1,4 @@
-name: SM6250 Kernel Build (Stable UAC2 + ALSA CI)
+name: SM6250 Kernel Build (Fixed Defconfig + Stable CI)
 
 on:
   workflow_dispatch:
@@ -23,7 +23,7 @@ jobs:
       # =========================
       # DEPENDENCIES
       # =========================
-      - name: Install build deps
+      - name: Install build dependencies
         run: |
           sudo apt update
           sudo apt install -y \
@@ -42,46 +42,55 @@ jobs:
           echo "$PWD/clang/bin" >> $GITHUB_PATH
 
       # =========================
-      # DEFCONFIG RESOLUTION (FIXED)
+      # FIND DEFCONFIG (SAFE)
       # =========================
-      - name: Locate defconfig safely
+      - name: Locate defconfig
         run: |
           DEFCONFIG=$(find arch/arm64/configs -type f -name "miatoll_defconfig" | head -n 1)
 
           if [ -z "$DEFCONFIG" ]; then
-            echo "ERROR: miatoll_defconfig not found"
-            find arch/arm64/configs -type f | grep miatoll || true
+            echo "ERROR: defconfig not found"
+            find arch/arm64/configs -name "*miatoll*"
             exit 1
           fi
 
           echo "DEFCONFIG=$DEFCONFIG" >> $GITHUB_ENV
-          echo "Using: $DEFCONFIG"
+          echo "Found defconfig: $DEFCONFIG"
 
       # =========================
-      # OUT DIR
+      # PREP OUT DIR
       # =========================
       - name: Prepare output directory
         run: mkdir -p out
 
       # =========================
-      # CONFIGURE KERNEL
+      # APPLY DEFCONFIG (FIXED)
       # =========================
-      - name: Apply defconfig
+      - name: Apply defconfig (FIXED PATH)
         run: |
-          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 $(basename ${DEFCONFIG})
+          echo "Raw DEFCONFIG: $DEFCONFIG"
+
+          # FIX: strip ONLY arch/arm64/configs/
+          DEF_REL=$(echo $DEFCONFIG | sed 's|arch/arm64/configs/||')
+
+          echo "Relative DEFCONFIG: $DEF_REL"
+
+          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 $DEF_REL
 
       # =========================
-      # VERIFY CONFIG (CRITICAL)
+      # CONFIG VALIDATION
       # =========================
-      - name: Validate kernel config
+      - name: Validate config
         run: |
-          test -f out/.config || exit 1
-          echo "Config generated OK"
+          test -f out/.config || {
+            echo "CONFIG FAILED"
+            exit 1
+          }
 
       # =========================
-      # UAC2 STACK CHECK
+      # UAC2 + ALSA SAFETY CHECK
       # =========================
-      - name: Validate UAC2 + ALSA stack
+      - name: Validate USB audio stack
         run: |
           CONFIG=out/.config
 
@@ -110,18 +119,17 @@ jobs:
             ARCH=arm64 \
             LLVM=1 \
             LLVM_IAS=1 \
-            CC=clang \
-            CROSS_COMPILE=aarch64-linux-gnu-
+            CC=clang
 
       # =========================
       # VERIFY OUTPUT
       # =========================
-      - name: Check kernel output
+      - name: Check build output
         run: |
           ls -lah out/arch/arm64/boot || true
 
       # =========================
-      # ANYKERNEL PACKAGING
+      # ANYKERNEL3 ZIP
       # =========================
       - name: Create flashable zip
         run: |
@@ -134,9 +142,9 @@ jobs:
           zip -r9 kernel.zip ./*
 
       # =========================
-      # ARTIFACT UPLOAD
+      # UPLOAD ARTIFACT
       # =========================
-      - name: Upload flashable zip
+      - name: Upload kernel zip
         uses: actions/upload-artifact@v4
         with:
           name: sm6250-kernel
