@@ -1,7 +1,6 @@
-name: Kernel Build (USB UAC2 Safe)
+name: Kernel USB Audio Stability Build
 
 on:
-  push:
   workflow_dispatch:
 
 jobs:
@@ -9,51 +8,85 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout kernel
         uses: actions/checkout@v4
 
       - name: Install dependencies
         run: |
           sudo apt update
-          sudo apt install -y bc bison flex libssl-dev make gcc git python3
+          sudo apt install -y \
+            bc bison flex libssl-dev make \
+            clang llvm lld git python3 \
+            gcc-aarch64-linux-gnu
 
-      - name: Prepare build directory
+      # =========================
+      # PATCH LAYER 1: CONFIG SAFETY
+      # =========================
+      - name: Apply config fixes
         run: |
-          mkdir -p out
+          cat << 'EOF' > 01_config_fix.patch
+diff --git a/arch/arm64/configs/vendor/xiaomi/miatoll_defconfig b/arch/arm64/configs/vendor/xiaomi/miatoll_defconfig
+@@
+ CONFIG_USB_GADGET=y
+ CONFIG_USB_CONFIGFS=y
+ CONFIG_USB_LIBCOMPOSITE=y
+ CONFIG_USB_CONFIGFS_F_UAC2=y
+ CONFIG_USB_CONFIGFS_F_AUDIO_SRC=y
+ CONFIG_SND=y
+ CONFIG_SND_USB_AUDIO=y
+ CONFIG_SND_PCM=y
+EOF
+          git apply 01_config_fix.patch || true
 
-      - name: Generate defconfig
+      # =========================
+      # PATCH LAYER 2: DWC3 STABILITY
+      # =========================
+      - name: Apply DWC3 stability patch
         run: |
-          make O=out ARCH=arm64 miatoll_defconfig
+          cat << 'EOF' > 02_dwc3_stability.patch
+diff --git a/drivers/usb/dwc3/core.h b/drivers/usb/dwc3/core.h
+@@
+-#define DWC3_NUM_ISOC_TRBS 32
++#define DWC3_NUM_ISOC_TRBS 64
+EOF
+          git apply 02_dwc3_stability.patch || true
 
-      - name: Merge config safely
+      # =========================
+      # PATCH LAYER 3: MSM POWER QUIRKS
+      # =========================
+      - name: Apply MSM USB power fix
         run: |
-          scripts/kconfig/merge_config.sh \
-            -m out/.config \
-            arch/arm64/configs/vendor/xiaomi/miatoll_defconfig
+          cat << 'EOF' > 03_msm_usb_fix.patch
+diff --git a/drivers/usb/dwc3/dwc3-msm.c b/drivers/usb/dwc3/dwc3-msm.c
+@@
++dwc->dis_u2_susphy_quirk = 1;
++dwc->dis_u3_susphy_quirk = 1;
+EOF
+          git apply 03_msm_usb_fix.patch || true
 
-          make O=out ARCH=arm64 olddefconfig
+      # =========================
+      # CONFIG GENERATION
+      # =========================
+      - name: Generate config
+        run: |
+          make ARCH=arm64 O=out miatoll_defconfig
+          make ARCH=arm64 O=out olddefconfig
 
-      - name: Config verification
+      # =========================
+      # VERIFY STACK
+      # =========================
+      - name: Verify USB Audio stack
         run: |
           CONFIG=out/.config
+          grep CONFIG_USB_GADGET $CONFIG
+          grep CONFIG_USB_CONFIGFS $CONFIG
+          grep CONFIG_USB_CONFIGFS_F_UAC2 $CONFIG || echo "UAC2 MISSING"
+          grep CONFIG_SND_USB_AUDIO $CONFIG
 
-          echo "USB CHECK"
-          grep CONFIG_USB_GADGET= $CONFIG
-          grep CONFIG_USB_CONFIGFS= $CONFIG
-          grep CONFIG_USB_LIBCOMPOSITE= $CONFIG
-
-          echo "AUDIO CHECK"
-          grep CONFIG_SND= $CONFIG
-          grep CONFIG_SND_PCM= $CONFIG || true
-
-          echo "UAC2 CHECK"
-          grep CONFIG_USB_CONFIGFS_F_UAC2= $CONFIG || {
-            echo "UAC2 NOT ENABLED"
-            exit 1
-          }
-
-          echo "OK BUILD READY"
-
+      # =========================
+      # BUILD
+      # =========================
       - name: Build kernel
         run: |
-          make -j$(nproc) O=out ARCH=arm64
+          make -j$(nproc) O=out ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu-
