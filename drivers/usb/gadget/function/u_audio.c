@@ -1,5 +1,5 @@
 /*
- * u_audio.c -- USB gadget ALSA engine (MATCHED STABLE CORE)
+ * u_audio.c -- USB gadget ALSA PCM engine (STABLE)
  */
 
 #include <linux/module.h>
@@ -8,123 +8,112 @@
 #include <sound/pcm_params.h>
 
 #include "u_audio.h"
-#include "u_uac2.h"
 
-/* =========================================================
- * STATE STRUCTURES (UNCHANGED ARCHITECTURE)
- * ========================================================= */
+#define MAX_BUFFER (PAGE_SIZE * 16)
+#define MIN_PERIODS 4
 
 struct uac_rtd_params {
 	struct snd_pcm_substream *ss;
-	ssize_t hw_ptr;
-
+	void *rbuf;
+	unsigned hw_ptr;
+	unsigned max_psize;
 	spinlock_t lock;
-
-	int usb_error_count;
+	int error_count;
 	bool stalled;
 };
 
-/* =========================================================
- * ERROR HANDLING (SAFE RECOVERY MODEL)
- * ========================================================= */
-
 static void uac_handle_error(struct uac_rtd_params *p)
 {
-	p->usb_error_count++;
+	p->error_count++;
 
-	if (p->usb_error_count > 32)
+	if (p->error_count > 32)
 		p->stalled = true;
-
-	if (p->usb_error_count < 8)
+	else if (p->error_count < 8)
 		p->stalled = false;
 }
 
-/* =========================================================
- * ISO CALLBACK (WINDOWS-STABLE VERSION)
- * ========================================================= */
+/* ---------------------------
+ * ISO COMPLETE CALLBACK
+ * --------------------------- */
 
-static void u_audio_complete(struct usb_ep *ep,
-			     struct usb_request *req)
+static void u_audio_complete(struct usb_ep *ep, struct usb_request *req)
 {
 	struct uac_rtd_params *p = req->context;
-	struct snd_pcm_substream *sub;
+	struct snd_pcm_substream *substream = p->ss;
 	struct snd_pcm_runtime *rt;
 	unsigned long flags;
+	unsigned int hw_ptr;
 
-	if (req->status)
-		uac_handle_error(p);
-
-	sub = p->ss;
-	if (!sub)
+	if (!substream)
 		goto requeue;
 
-	snd_pcm_stream_lock_irqsave(sub, flags);
-	rt = sub->runtime;
+	snd_pcm_stream_lock_irqsave(substream, flags);
+	rt = substream->runtime;
 
-	if (!rt || !snd_pcm_running(sub)) {
-		snd_pcm_stream_unlock_irqrestore(sub, flags);
+	if (!rt || !snd_pcm_running(substream)) {
+		snd_pcm_stream_unlock_irqrestore(substream, flags);
 		goto requeue;
 	}
 
 	spin_lock(&p->lock);
 
 	if (p->stalled) {
-		p->hw_ptr = 0;
-		p->stalled = false;
-		p->usb_error_count = 0;
+		spin_unlock(&p->lock);
+		snd_pcm_stream_unlock_irqrestore(substream, flags);
+		goto requeue;
 	}
 
-	/* safe bounds */
-	if (req->actual > rt->dma_bytes) {
-		p->hw_ptr = 0;
-		goto unlock;
-	}
+	hw_ptr = p->hw_ptr;
 
-	/* copy ring buffer */
-	unsigned int hp = p->hw_ptr;
-	unsigned int rem = rt->dma_bytes - hp;
+	if (hw_ptr >= rt->dma_bytes)
+		hw_ptr = 0;
 
-	if (rem < req->actual) {
-		memcpy(req->buf, rt->dma_area + hp, rem);
-		memcpy(req->buf + rem, rt->dma_area, req->actual - rem);
+	if (hw_ptr + req->actual <= rt->dma_bytes) {
+		memcpy(req->buf, rt->dma_area + hw_ptr, req->actual);
 	} else {
-		memcpy(req->buf, rt->dma_area + hp, req->actual);
+		unsigned split = rt->dma_bytes - hw_ptr;
+		memcpy(req->buf, rt->dma_area + hw_ptr, split);
+		memcpy(req->buf + split, rt->dma_area, req->actual - split);
 	}
 
-	p->hw_ptr = (hp + req->actual) % rt->dma_bytes;
+	p->hw_ptr = (hw_ptr + req->actual) % rt->dma_bytes;
 
-unlock:
 	spin_unlock(&p->lock);
 
-	if (p->hw_ptr % snd_pcm_lib_period_bytes(sub) == 0)
-		snd_pcm_period_elapsed(sub);
+	if ((p->hw_ptr % snd_pcm_lib_period_bytes(substream)) < req->actual)
+		snd_pcm_period_elapsed(substream);
 
-	snd_pcm_stream_unlock_irqrestore(sub, flags);
+	snd_pcm_stream_unlock_irqrestore(substream, flags);
 
 requeue:
-	usb_ep_queue(ep, req, GFP_ATOMIC);
+	if (usb_ep_queue(ep, req, GFP_ATOMIC))
+		uac_handle_error(p);
 }
 
-/* =========================================================
- * TRIGGER (RESET SAFE STATE)
- * ========================================================= */
+/* ---------------------------
+ * PCM TRIGGER
+ * --------------------------- */
 
-static int u_audio_trigger(struct snd_pcm_substream *sub, int cmd)
+static int uac_trigger(struct snd_pcm_substream *substream, int cmd)
 {
-	struct uac_rtd_params *p = sub->runtime->private_data;
+	struct uac_rtd_params *p = snd_pcm_substream_chip(substream);
 	unsigned long flags;
 
 	spin_lock_irqsave(&p->lock, flags);
 
-	if (cmd == SNDRV_PCM_TRIGGER_START) {
-		p->ss = sub;
-		p->hw_ptr = 0;
+	switch (cmd) {
+	case SNDRV_PCM_TRIGGER_START:
+	case SNDRV_PCM_TRIGGER_RESUME:
+		p->ss = substream;
 		p->stalled = false;
-		p->usb_error_count = 0;
-	}
+		p->error_count = 0;
+		break;
 
-	if (cmd == SNDRV_PCM_TRIGGER_STOP)
+	case SNDRV_PCM_TRIGGER_STOP:
+	case SNDRV_PCM_TRIGGER_SUSPEND:
 		p->ss = NULL;
+		break;
+	}
 
 	spin_unlock_irqrestore(&p->lock, flags);
 	return 0;
