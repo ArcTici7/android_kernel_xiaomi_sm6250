@@ -1,7 +1,3 @@
-/*
- * u_audio.c -- USB gadget ALSA PCM engine (STABLE)
- */
-
 #include <linux/module.h>
 #include <sound/core.h>
 #include <sound/pcm.h>
@@ -9,32 +5,34 @@
 
 #include "u_audio.h"
 
-#define MAX_BUFFER (PAGE_SIZE * 16)
-#define MIN_PERIODS 4
+#define MAX_BUF (PAGE_SIZE * 16)
+
+/*
+ * RULES:
+ * - no fake clock logic
+ * - no error hysteresis hacks
+ * - strict modulo pointer safety
+ */
 
 struct uac_rtd_params {
 	struct snd_pcm_substream *ss;
-	void *rbuf;
 	unsigned hw_ptr;
-	unsigned max_psize;
+	void *rbuf;
 	spinlock_t lock;
 	int error_count;
 	bool stalled;
 };
 
-static void uac_handle_error(struct uac_rtd_params *p)
+static void handle_error(struct uac_rtd_params *p)
 {
 	p->error_count++;
 
+	/* SIMPLE AND STABLE */
 	if (p->error_count > 32)
 		p->stalled = true;
 	else if (p->error_count < 8)
 		p->stalled = false;
 }
-
-/* ---------------------------
- * ISO COMPLETE CALLBACK
- * --------------------------- */
 
 static void u_audio_complete(struct usb_ep *ep, struct usb_request *req)
 {
@@ -42,7 +40,7 @@ static void u_audio_complete(struct usb_ep *ep, struct usb_request *req)
 	struct snd_pcm_substream *substream = p->ss;
 	struct snd_pcm_runtime *rt;
 	unsigned long flags;
-	unsigned int hw_ptr;
+	unsigned int ptr;
 
 	if (!substream)
 		goto requeue;
@@ -63,20 +61,21 @@ static void u_audio_complete(struct usb_ep *ep, struct usb_request *req)
 		goto requeue;
 	}
 
-	hw_ptr = p->hw_ptr;
+	ptr = p->hw_ptr;
 
-	if (hw_ptr >= rt->dma_bytes)
-		hw_ptr = 0;
+	/* HARD SAFETY BOUNDARY */
+	if (ptr >= rt->dma_bytes)
+		ptr = 0;
 
-	if (hw_ptr + req->actual <= rt->dma_bytes) {
-		memcpy(req->buf, rt->dma_area + hw_ptr, req->actual);
+	if (ptr + req->actual <= rt->dma_bytes) {
+		memcpy(req->buf, rt->dma_area + ptr, req->actual);
 	} else {
-		unsigned split = rt->dma_bytes - hw_ptr;
-		memcpy(req->buf, rt->dma_area + hw_ptr, split);
+		unsigned split = rt->dma_bytes - ptr;
+		memcpy(req->buf, rt->dma_area + ptr, split);
 		memcpy(req->buf + split, rt->dma_area, req->actual - split);
 	}
 
-	p->hw_ptr = (hw_ptr + req->actual) % rt->dma_bytes;
+	p->hw_ptr = (ptr + req->actual) % rt->dma_bytes;
 
 	spin_unlock(&p->lock);
 
@@ -87,12 +86,8 @@ static void u_audio_complete(struct usb_ep *ep, struct usb_request *req)
 
 requeue:
 	if (usb_ep_queue(ep, req, GFP_ATOMIC))
-		uac_handle_error(p);
+		handle_error(p);
 }
-
-/* ---------------------------
- * PCM TRIGGER
- * --------------------------- */
 
 static int uac_trigger(struct snd_pcm_substream *substream, int cmd)
 {
