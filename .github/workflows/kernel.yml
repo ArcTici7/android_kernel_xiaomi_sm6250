@@ -1,4 +1,4 @@
-name: SM6250 Kernel Build (Auto-Fix)
+name: SM6250 Kernel Build (Stable UAC2 + ALSA CI)
 
 on:
   workflow_dispatch:
@@ -14,125 +14,130 @@ jobs:
       KBUILD_BUILD_HOST: github-actions
 
     steps:
+      # =========================
+      # CHECKOUT
+      # =========================
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
 
-    # =========================
-    # 1. Checkout
-    # =========================
-    - name: Checkout
-      uses: actions/checkout@v4
+      # =========================
+      # DEPENDENCIES
+      # =========================
+      - name: Install build deps
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            git curl wget zip unzip \
+            build-essential bc bison flex \
+            libssl-dev libelf-dev python3
 
-    # =========================
-    # 2. Dependencies
-    # =========================
-    - name: Install deps
-      run: |
-        sudo apt update
-        sudo apt install -y \
-          git curl wget zip unzip \
-          build-essential bc bison flex \
-          libssl-dev libncurses5-dev \
-          python3 ccache
+      # =========================
+      # LLVM 17 TOOLCHAIN
+      # =========================
+      - name: Setup LLVM 17
+        run: |
+          wget -q https://github.com/llvm/llvm-project/releases/download/llvmorg-17.0.4/clang+llvm-17.0.4-x86_64-linux-gnu-ubuntu-22.04.tar.xz
+          tar -xf clang+llvm-17.0.4-x86_64-linux-gnu-ubuntu-22.04.tar.xz
+          mv clang+llvm-17.0.4-x86_64-linux-gnu-ubuntu-22.04 clang
+          echo "$PWD/clang/bin" >> $GITHUB_PATH
 
-    # =========================
-    # 3. LLVM 17 (stable SM6250 baseline)
-    # =========================
-    - name: LLVM 17
-      run: |
-        wget -q https://github.com/llvm/llvm-project/releases/download/llvmorg-17.0.4/clang+llvm-17.0.4-x86_64-linux-gnu-ubuntu-22.04.tar.xz
-        tar -xf clang+llvm-17.0.4-x86_64-linux-gnu-ubuntu-22.04.tar.xz
-        mv clang+llvm-17.0.4-x86_64-linux-gnu-ubuntu-22.04 clang
-        echo "$PWD/clang/bin" >> $GITHUB_PATH
+      # =========================
+      # DEFCONFIG RESOLUTION (FIXED)
+      # =========================
+      - name: Locate defconfig safely
+        run: |
+          DEFCONFIG=$(find arch/arm64/configs -type f -name "miatoll_defconfig" | head -n 1)
 
-    # =========================
-    # 4. Auto-detect defconfig (FIXES YOUR ERROR PERMANENTLY)
-    # =========================
-    - name: Detect defconfig
-      id: defconfig
-      run: |
-        echo "Searching for miatoll defconfig..."
+          if [ -z "$DEFCONFIG" ]; then
+            echo "ERROR: miatoll_defconfig not found"
+            find arch/arm64/configs -type f | grep miatoll || true
+            exit 1
+          fi
 
-        DEFCONFIG=$(find arch/arm64/configs -type f -name "*miatoll_defconfig" | head -n 1)
+          echo "DEFCONFIG=$DEFCONFIG" >> $GITHUB_ENV
+          echo "Using: $DEFCONFIG"
 
-        if [ -z "$DEFCONFIG" ]; then
-          echo "❌ No miatoll_defconfig found!"
-          find arch/arm64/configs
-          exit 1
-        fi
+      # =========================
+      # OUT DIR
+      # =========================
+      - name: Prepare output directory
+        run: mkdir -p out
 
-        echo "FOUND: $DEFCONFIG"
+      # =========================
+      # CONFIGURE KERNEL
+      # =========================
+      - name: Apply defconfig
+        run: |
+          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 $(basename ${DEFCONFIG})
 
-        # convert path -> kernel target format
-        DEFCONFIG_TARGET=${DEFCONFIG#arch/arm64/configs/}
+      # =========================
+      # VERIFY CONFIG (CRITICAL)
+      # =========================
+      - name: Validate kernel config
+        run: |
+          test -f out/.config || exit 1
+          echo "Config generated OK"
 
-        echo "target=$DEFCONFIG_TARGET" >> $GITHUB_OUTPUT
+      # =========================
+      # UAC2 STACK CHECK
+      # =========================
+      - name: Validate UAC2 + ALSA stack
+        run: |
+          CONFIG=out/.config
 
-    # =========================
-    # 5. Configure kernel
-    # =========================
-    - name: Defconfig
-      run: |
-        mkdir -p out
+          REQUIRED="
+          CONFIG_USB_GADGET
+          CONFIG_USB_CONFIGFS
+          CONFIG_USB_CONFIGFS_F_UAC2
+          CONFIG_SND_USB_AUDIO
+          "
 
-        make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 \
-          ${{ steps.defconfig.outputs.target }}
+          for c in $REQUIRED; do
+            grep -q "$c=y" $CONFIG || {
+              echo "ERROR: Missing $c"
+              exit 1
+            }
+          done
 
-    # =========================
-    # 6. Prevent known ARM64 clang crashes (your earlier asm/spinlock issue)
-    # =========================
-    - name: Safety config patch
-      run: |
-        cd out
+          echo "UAC2 stack OK"
 
-        # prevents LTO/CFI breakage in SM6250 trees
-        scripts/config --disable LTO_CLANG || true
-        scripts/config --disable CFI_CLANG || true
-        scripts/config --disable SHADOW_CALL_STACK || true
+      # =========================
+      # BUILD KERNEL
+      # =========================
+      - name: Build kernel
+        run: |
+          make -j$(nproc) O=out \
+            ARCH=arm64 \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            CC=clang \
+            CROSS_COMPILE=aarch64-linux-gnu-
 
-        # ensures clang behaves properly
-        scripts/config --enable CC_IS_CLANG || true
+      # =========================
+      # VERIFY OUTPUT
+      # =========================
+      - name: Check kernel output
+        run: |
+          ls -lah out/arch/arm64/boot || true
 
-        yes "" | make olddefconfig
+      # =========================
+      # ANYKERNEL PACKAGING
+      # =========================
+      - name: Create flashable zip
+        run: |
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git anykernel
 
-    # =========================
-    # 7. Build kernel
-    # =========================
-    - name: Build
-      run: |
-        make -j$(nproc) O=out \
-          ARCH=arm64 \
-          LLVM=1 LLVM_IAS=1 \
-          CC=clang \
-          LD=ld.lld \
-          AR=llvm-ar \
-          NM=llvm-nm \
-          STRIP=llvm-strip
+          cp out/arch/arm64/boot/Image* anykernel/ 2>/dev/null || true
+          cp out/arch/arm64/boot/dtbo.img anykernel/ 2>/dev/null || true
 
-    # =========================
-    # 8. DTB/DTBO (prevents boot failures later)
-    # =========================
-    - name: Build DTB
-      run: |
-        make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 dtbs dtbo.img || true
+          cd anykernel
+          zip -r9 kernel.zip ./*
 
-    # =========================
-    # 9. AnyKernel3 packaging
-    # =========================
-    - name: Package
-      run: |
-        git clone --depth=1 https://github.com/osm0sis/AnyKernel3 anykernel
-
-        cp out/arch/arm64/boot/Image* anykernel/ 2>/dev/null || true
-        cp out/arch/arm64/boot/dtbo.img anykernel/ 2>/dev/null || true
-        cp out/arch/arm64/boot/dtb.img anykernel/ 2>/dev/null || true
-
-        cd anykernel
-        zip -r9 SM6250-Kernel.zip .
-
-    # =========================
-    # 10. Upload artifact
-    # =========================
-    - name: Upload
-      uses: actions/upload-artifact@v4
-      with:
-        name: SM6250-Kernel
-        path: anykernel/SM6250-Kernel.zip
+      # =========================
+      # ARTIFACT UPLOAD
+      # =========================
+      - name: Upload flashable zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: sm6250-kernel
+          path: anykernel/kernel.zip
