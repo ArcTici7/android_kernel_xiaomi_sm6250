@@ -1,4 +1,4 @@
-name: SM6250 Kernel Build (Fixed Defconfig + Stable CI)
+name: SM6250 Kernel UAC2 Build (Stable)
 
 on:
   workflow_dispatch:
@@ -7,145 +7,137 @@ jobs:
   build:
     runs-on: ubuntu-22.04
 
-    env:
-      ARCH: arm64
-      SUBARCH: arm64
-      KBUILD_BUILD_USER: kernel
-      KBUILD_BUILD_HOST: github-actions
-
     steps:
-      # =========================
-      # CHECKOUT
-      # =========================
-      - name: Checkout kernel source
-        uses: actions/checkout@v4
+    # =========================
+    # 1. Checkout correct kernel
+    # =========================
+    - name: Clone kernel
+      run: |
+        git clone https://github.com/ArcTici7/android_kernel_xiaomi_sm6250.git -b lineage-21 kernel
+        cd kernel
 
-      # =========================
-      # DEPENDENCIES
-      # =========================
-      - name: Install build dependencies
-        run: |
-          sudo apt update
-          sudo apt install -y \
-            git curl wget zip unzip \
-            build-essential bc bison flex \
-            libssl-dev libelf-dev python3
+    - name: Set working dir
+      run: echo "KERNEL_DIR=kernel" >> $GITHUB_ENV
 
-      # =========================
-      # LLVM 17 TOOLCHAIN
-      # =========================
-      - name: Setup LLVM 17
-        run: |
-          wget -q https://github.com/llvm/llvm-project/releases/download/llvmorg-17.0.4/clang+llvm-17.0.4-x86_64-linux-gnu-ubuntu-22.04.tar.xz
-          tar -xf clang+llvm-17.0.4-x86_64-linux-gnu-ubuntu-22.04.tar.xz
-          mv clang+llvm-17.0.4-x86_64-linux-gnu-ubuntu-22.04 clang
-          echo "$PWD/clang/bin" >> $GITHUB_PATH
+    # =========================
+    # 2. Install dependencies
+    # =========================
+    - name: Install deps
+      run: |
+        sudo apt update
+        sudo apt install -y \
+          bc bison flex libssl-dev libelf-dev \
+          make git curl xz-utils zip
 
-      # =========================
-      # FIND DEFCONFIG (SAFE)
-      # =========================
-      - name: Locate defconfig
-        run: |
-          DEFCONFIG=$(find arch/arm64/configs -type f -name "miatoll_defconfig" | head -n 1)
+    # =========================
+    # 3. Install LLVM 17 (FIX)
+    # =========================
+    - name: Setup LLVM 17
+      run: |
+        wget https://github.com/llvm/llvm-project/releases/download/llvmorg-17.0.4/clang+llvm-17.0.4-x86_64-linux-gnu-ubuntu-22.04.tar.xz
+        tar -xf clang+llvm-17.0.4-x86_64-linux-gnu-ubuntu-22.04.tar.xz
+        mv clang+llvm-17.0.4-x86_64-linux-gnu-ubuntu-22.04 clang
+        echo "$(pwd)/clang/bin" >> $GITHUB_PATH
 
-          if [ -z "$DEFCONFIG" ]; then
-            echo "ERROR: defconfig not found"
-            find arch/arm64/configs -name "*miatoll*"
-            exit 1
-          fi
+    # =========================
+    # 4. Environment
+    # =========================
+    - name: Setup env
+      run: |
+        echo "ARCH=arm64" >> $GITHUB_ENV
+        echo "SUBARCH=arm64" >> $GITHUB_ENV
+        echo "KBUILD_BUILD_USER=kernel" >> $GITHUB_ENV
+        echo "KBUILD_BUILD_HOST=github-actions" >> $GITHUB_ENV
 
-          echo "DEFCONFIG=$DEFCONFIG" >> $GITHUB_ENV
-          echo "Found defconfig: $DEFCONFIG"
+    # =========================
+    # 5. Defconfig (FIXED CORRECTLY)
+    # =========================
+    - name: Apply defconfig
+      run: |
+        cd $KERNEL_DIR
+        mkdir -p out
 
-      # =========================
-      # PREP OUT DIR
-      # =========================
-      - name: Prepare output directory
-        run: mkdir -p out
+        make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 vendor/xiaomi/miatoll_defconfig
 
-      # =========================
-      # APPLY DEFCONFIG (FIXED)
-      # =========================
-      - name: Apply defconfig (FIXED PATH)
-        run: |
-          echo "Raw DEFCONFIG: $DEFCONFIG"
+    # =========================
+    # 6. Resolve config (CRITICAL)
+    # =========================
+    - name: olddefconfig
+      run: |
+        cd $KERNEL_DIR
+        make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig
 
-          # FIX: strip ONLY arch/arm64/configs/
-          DEF_REL=$(echo $DEFCONFIG | sed 's|arch/arm64/configs/||')
+    # =========================
+    # 7. Verify UAC2 config
+    # =========================
+    - name: Verify UAC2
+      run: |
+        cd $KERNEL_DIR
+        CONFIG=out/.config
 
-          echo "Relative DEFCONFIG: $DEF_REL"
+        echo "Checking USB gadget stack..."
 
-          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 $DEF_REL
+        grep CONFIG_USB_GADGET=y $CONFIG || exit 1
+        grep CONFIG_USB_CONFIGFS=y $CONFIG || exit 1
 
-      # =========================
-      # CONFIG VALIDATION
-      # =========================
-      - name: Validate config
-        run: |
-          test -f out/.config || {
-            echo "CONFIG FAILED"
-            exit 1
-          }
+        if grep -q CONFIG_USB_CONFIGFS_F_UAC2=y $CONFIG; then
+          echo "✔ UAC2 enabled"
+        else
+          echo "❌ UAC2 missing"
+          exit 1
+        fi
 
-      # =========================
-      # UAC2 + ALSA SAFETY CHECK
-      # =========================
-      - name: Validate USB audio stack
-        run: |
-          CONFIG=out/.config
+        grep CONFIG_SND_USB_AUDIO=y $CONFIG || exit 1
 
-          REQUIRED="
-          CONFIG_USB_GADGET
-          CONFIG_USB_CONFIGFS
-          CONFIG_USB_CONFIGFS_F_UAC2
-          CONFIG_SND_USB_AUDIO
-          "
+    # =========================
+    # 8. Build kernel
+    # =========================
+    - name: Build kernel
+      run: |
+        cd $KERNEL_DIR
+        make -j$(nproc) O=out ARCH=arm64 LLVM=1 LLVM_IAS=1
 
-          for c in $REQUIRED; do
-            grep -q "$c=y" $CONFIG || {
-              echo "ERROR: Missing $c"
-              exit 1
-            }
-          done
+    # =========================
+    # 9. Flash sanity test
+    # =========================
+    - name: Validate output
+      run: |
+        cd $KERNEL_DIR
 
-          echo "UAC2 stack OK"
+        echo "Checking kernel image..."
+        ls out/arch/arm64/boot/
 
-      # =========================
-      # BUILD KERNEL
-      # =========================
-      - name: Build kernel
-        run: |
-          make -j$(nproc) O=out \
-            ARCH=arm64 \
-            LLVM=1 \
-            LLVM_IAS=1 \
-            CC=clang
+        test -f out/arch/arm64/boot/Image.gz-dtb || {
+          echo "❌ Missing Image.gz-dtb"
+          exit 1
+        }
 
-      # =========================
-      # VERIFY OUTPUT
-      # =========================
-      - name: Check build output
-        run: |
-          ls -lah out/arch/arm64/boot || true
+        echo "✔ Kernel image OK"
 
-      # =========================
-      # ANYKERNEL3 ZIP
-      # =========================
-      - name: Create flashable zip
-        run: |
-          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git anykernel
+    # =========================
+    # 10. Package AnyKernel3
+    # =========================
+    - name: Package zip
+      run: |
+        cd $KERNEL_DIR
 
-          cp out/arch/arm64/boot/Image* anykernel/ 2>/dev/null || true
-          cp out/arch/arm64/boot/dtbo.img anykernel/ 2>/dev/null || true
+        git clone https://github.com/osm0sis/AnyKernel3.git AnyKernel3
+        rm -rf AnyKernel3/.git
 
-          cd anykernel
-          zip -r9 kernel.zip ./*
+        cp out/arch/arm64/boot/Image.gz-dtb AnyKernel3/
 
-      # =========================
-      # UPLOAD ARTIFACT
-      # =========================
-      - name: Upload kernel zip
-        uses: actions/upload-artifact@v4
-        with:
-          name: sm6250-kernel
-          path: anykernel/kernel.zip
+        if [ -f out/arch/arm64/boot/dtbo.img ]; then
+          cp out/arch/arm64/boot/dtbo.img AnyKernel3/
+        fi
+
+        cd AnyKernel3
+        zip -r9 ../Kernel-UAC2-SM6250.zip .
+
+    # =========================
+    # 11. Upload artifact
+    # =========================
+    - name: Upload zip
+      uses: actions/upload-artifact@v4
+      with:
+        name: Kernel-UAC2-SM6250
+        path: kernel/Kernel-UAC2-SM6250.zip
