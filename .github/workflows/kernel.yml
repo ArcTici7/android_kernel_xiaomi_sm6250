@@ -1,118 +1,73 @@
-name: Android Kernel Build (UAC2 + AnyKernel3)
+name: Kernel Build (LLVM 17 UAC2 Optimized)
 
 on:
   workflow_dispatch:
-  push:
-    branches: [ lineage-21 ]
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
 
     steps:
-      # =========================
-      # 1. Checkout source
-      # =========================
-      - name: Checkout Kernel Source
-        uses: actions/checkout@v4
+    - name: Checkout kernel
+      uses: actions/checkout@v4
 
-      # =========================
-      # 2. Install dependencies
-      # =========================
-      - name: Install build dependencies
-        run: |
-          sudo apt update
-          sudo apt install -y \
-            git curl wget zip unzip bc \
-            build-essential libssl-dev \
-            flex bison \
-            python3 \
-            clang lld llvm \
-            gcc-aarch64-linux-gnu
+    - name: Install dependencies
+      run: |
+        sudo apt update
+        sudo apt install -y \
+          bc bison build-essential ccache curl flex git \
+          libssl-dev libelf-dev dwarves python3 unzip zip
 
-      # =========================
-      # 3. Environment setup
-      # =========================
-      - name: Set environment variables
-        run: |
-          echo "ARCH=arm64" >> $GITHUB_ENV
-          echo "SUBARCH=arm64" >> $GITHUB_ENV
-          echo "KBUILD_BUILD_USER=uac2_builder" >> $GITHUB_ENV
-          echo "KBUILD_BUILD_HOST=github-actions" >> $GITHUB_ENV
+    - name: Download LLVM 17.0.4
+      run: |
+        mkdir clang
+        curl -L -o clang.tar.xz \
+        https://github.com/llvm/llvm-project/releases/download/llvmorg-17.0.4/clang+llvm-17.0.4-x86_64-linux-gnu-ubuntu-22.04.tar.xz
 
-      # =========================
-      # 4. Prepare output directory
-      # =========================
-      - name: Prepare build directory
-        run: |
-          mkdir -p out
+        tar -xf clang.tar.xz -C clang --strip-components=1
 
-      # =========================
-      # 5. Apply DEFCONFIG (FIXED PATH)
-      # =========================
-      - name: Apply defconfig
-        run: |
-          make O=out ARCH=arm64 vendor/xiaomi/miatoll_defconfig
+    - name: Export toolchain
+      run: |
+        echo "CLANG_PATH=$PWD/clang" >> $GITHUB_ENV
+        echo "$PWD/clang/bin" >> $GITHUB_PATH
+        export PATH=$PWD/clang/bin:$PATH
+        clang --version
 
-      # =========================
-      # 6. Build kernel
-      # =========================
-      - name: Build kernel
-        run: |
-          make -j$(nproc) O=out ARCH=arm64 \
-            CC=clang \
-            LD=ld.lld \
-            LLVM=1 \
-            LLVM_IAS=1
+    - name: Setup kernel build env
+      run: |
+        mkdir -p out
 
-      # =========================
-      # 7. Build modules
-      # =========================
-      - name: Build modules
-        run: |
-          make -j$(nproc) O=out ARCH=arm64 modules
+    - name: Defconfig
+      run: |
+        make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 miatoll_defconfig
 
-      # =========================
-      # 8. Clone AnyKernel3
-      # =========================
-      - name: Clone AnyKernel3
-        run: |
-          git clone https://github.com/osm0sis/AnyKernel3.git anykernel
+    - name: Build kernel
+      run: |
+        make -j$(nproc) O=out ARCH=arm64 \
+          LLVM=1 LLVM_IAS=1 \
+          CC=clang \
+          AR=llvm-ar \
+          NM=llvm-nm \
+          OBJCOPY=llvm-objcopy \
+          OBJDUMP=llvm-objdump \
+          STRIP=llvm-strip \
+          CROSS_COMPILE=aarch64-linux-gnu- \
+          Image.gz dtbo.img
 
-      # =========================
-      # 9. Copy kernel image
-      # =========================
-      - name: Copy kernel image
-        run: |
-          if [ -f out/arch/arm64/boot/Image ]; then
-            cp out/arch/arm64/boot/Image anykernel/
-          elif [ -f out/arch/arm64/boot/Image.gz-dtb ]; then
-            cp out/arch/arm64/boot/Image.gz-dtb anykernel/
-          else
-            echo "No kernel image found!"
-            exit 1
-          fi
+    - name: Clone AnyKernel3
+      run: |
+        git clone https://github.com/osm0sis/AnyKernel3.git AnyKernel3
 
-      # =========================
-      # 10. Copy modules (optional)
-      # =========================
-      - name: Copy modules
-        run: |
-          find out -name "*.ko" -exec cp {} anykernel/modules/ \; || true
+    - name: Package ZIP
+      run: |
+        cp out/arch/arm64/boot/Image.gz AnyKernel3/
+        cp out/arch/arm64/boot/dtbo.img AnyKernel3/ || true
 
-      # =========================
-      # 11. Create flashable ZIP
-      # =========================
-      - name: Create flashable ZIP
-        run: |
-          cd anykernel
-          zip -r9 ../UAC2-Kernel-Flashable.zip ./*
+        cd AnyKernel3
+        zip -r9 kernel.zip ./*
 
-      # =========================
-      # 12. Upload artifact
-      # =========================
-      - name: Upload kernel zip
-        uses: actions/upload-artifact@v4
-        with:
-          name: UAC2-Kernel-Zip
-          path: UAC2-Kernel-Flashable.zip
+    - name: Upload flashable zip
+      uses: actions/upload-artifact@v4
+      with:
+        name: kernel-flashable-zip
+        path: AnyKernel3/kernel.zip
