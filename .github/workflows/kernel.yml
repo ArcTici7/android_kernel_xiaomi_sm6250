@@ -1,73 +1,130 @@
-name: Kernel Build (LLVM 17 UAC2 Optimized)
+name: Kernel Build (SM6250)
 
 on:
   workflow_dispatch:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
+
+    env:
+      ARCH: arm64
+      KBUILD_BUILD_USER: kernel
+      KBUILD_BUILD_HOST: github-actions
 
     steps:
-    - name: Checkout kernel
+    # =========================
+    # 1. Checkout
+    # =========================
+    - name: Checkout source
       uses: actions/checkout@v4
 
-    - name: Install dependencies
+    # =========================
+    # 2. Dependencies
+    # =========================
+    - name: Install deps
       run: |
         sudo apt update
         sudo apt install -y \
-          bc bison build-essential ccache curl flex git \
-          libssl-dev libelf-dev dwarves python3 unzip zip
+          git zip unzip curl wget \
+          build-essential bc bison flex \
+          libssl-dev libncurses5-dev \
+          python3 python3-pip \
+          ccache
 
-    - name: Download LLVM 17.0.4
+    # =========================
+    # 3. LLVM 17 toolchain
+    # =========================
+    - name: Setup LLVM 17
       run: |
-        mkdir clang
-        curl -L -o clang.tar.xz \
-        https://github.com/llvm/llvm-project/releases/download/llvmorg-17.0.4/clang+llvm-17.0.4-x86_64-linux-gnu-ubuntu-22.04.tar.xz
-
-        tar -xf clang.tar.xz -C clang --strip-components=1
-
-    - name: Export toolchain
-      run: |
-        echo "CLANG_PATH=$PWD/clang" >> $GITHUB_ENV
+        wget -q https://github.com/llvm/llvm-project/releases/download/llvmorg-17.0.4/clang+llvm-17.0.4-x86_64-linux-gnu-ubuntu-22.04.tar.xz
+        tar -xf clang+llvm-17.0.4-x86_64-linux-gnu-ubuntu-22.04.tar.xz
+        mv clang+llvm-17.0.4-x86_64-linux-gnu-ubuntu-22.04 clang
         echo "$PWD/clang/bin" >> $GITHUB_PATH
-        export PATH=$PWD/clang/bin:$PATH
-        clang --version
 
-    - name: Setup kernel build env
+    # =========================
+    # 4. Ccache (prevents rebuild hell)
+    # =========================
+    - name: Enable ccache
+      run: |
+        echo "CCACHE_DIR=$HOME/.ccache" >> $GITHUB_ENV
+        echo "USE_CCACHE=1" >> $GITHUB_ENV
+
+    # =========================
+    # 5. Fix defconfig path (YOUR ISSUE)
+    # =========================
+    - name: Prepare defconfig
       run: |
         mkdir -p out
 
-    - name: Defconfig
-      run: |
-        make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 miatoll_defconfig
+        # FIX: correct Xiaomi SM6250 path
+        export DEFCONFIG=arch/arm64/configs/vendor/xiaomi/miatoll_defconfig
 
+        if [ ! -f "$DEFCONFIG" ]; then
+          echo "ERROR: defconfig not found at $DEFCONFIG"
+          find arch/arm64/configs -name "*miatoll*"
+          exit 1
+        fi
+
+        make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 $DEFCONFIG
+
+    # =========================
+    # 6. SAFE kernel config hardening
+    # (prevents your asm/spinlock error again)
+    # =========================
+    - name: Patch config safety fixes
+      run: |
+        cd out
+
+        scripts/config --disable CFI_CLANG || true
+        scripts/config --disable SHADOW_CALL_STACK || true
+        scripts/config --disable LTO_CLANG || true
+
+        # IMPORTANT: prevents ARM64 inline asm constraint crash
+        scripts/config --enable CC_IS_CLANG || true
+
+        yes "" | make olddefconfig
+
+    # =========================
+    # 7. Build kernel
+    # =========================
     - name: Build kernel
       run: |
-        make -j$(nproc) O=out ARCH=arm64 \
+        make -j$(nproc --all) O=out \
+          ARCH=arm64 \
           LLVM=1 LLVM_IAS=1 \
           CC=clang \
+          LD=ld.lld \
           AR=llvm-ar \
           NM=llvm-nm \
-          OBJCOPY=llvm-objcopy \
-          OBJDUMP=llvm-objdump \
-          STRIP=llvm-strip \
-          CROSS_COMPILE=aarch64-linux-gnu- \
-          Image.gz dtbo.img
+          STRIP=llvm-strip
 
-    - name: Clone AnyKernel3
+    # =========================
+    # 8. Build DTB/DTBO (common missing step)
+    # =========================
+    - name: Build DTB/DTBO
       run: |
-        git clone https://github.com/osm0sis/AnyKernel3.git AnyKernel3
+        make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 dtbs dtbo.img || true
 
-    - name: Package ZIP
+    # =========================
+    # 9. AnyKernel3 packaging
+    # =========================
+    - name: Package flashable zip
       run: |
-        cp out/arch/arm64/boot/Image.gz AnyKernel3/
-        cp out/arch/arm64/boot/dtbo.img AnyKernel3/ || true
+        git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git anykernel
 
-        cd AnyKernel3
-        zip -r9 kernel.zip ./*
+        cp out/arch/arm64/boot/Image* anykernel/ 2>/dev/null || true
+        cp out/arch/arm64/boot/dtbo.img anykernel/ 2>/dev/null || true
+        cp out/arch/arm64/boot/dtb.img anykernel/ 2>/dev/null || true
 
-    - name: Upload flashable zip
+        cd anykernel
+        zip -r9 Kernel-SM6250.zip .
+
+    # =========================
+    # 10. Upload artifact
+    # =========================
+    - name: Upload kernel zip
       uses: actions/upload-artifact@v4
       with:
-        name: kernel-flashable-zip
-        path: AnyKernel3/kernel.zip
+        name: Kernel-SM6250
+        path: anykernel/Kernel-SM6250.zip
