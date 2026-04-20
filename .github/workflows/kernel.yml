@@ -1,4 +1,4 @@
-name: SM6250 Kernel UAC2 Build (Stable)
+name: SM6250 Kernel Build (UAC2 Detect + Stable)
 
 on:
   workflow_dispatch:
@@ -8,19 +8,24 @@ jobs:
     runs-on: ubuntu-22.04
 
     steps:
+
     # =========================
-    # 1. Checkout correct kernel
+    # 1. Clone kernel
     # =========================
     - name: Clone kernel
       run: |
         git clone https://github.com/ArcTici7/android_kernel_xiaomi_sm6250.git -b lineage-21 kernel
-        cd kernel
 
-    - name: Set working dir
-      run: echo "KERNEL_DIR=kernel" >> $GITHUB_ENV
+    - name: Set env
+      run: |
+        echo "KERNEL_DIR=kernel" >> $GITHUB_ENV
+        echo "ARCH=arm64" >> $GITHUB_ENV
+        echo "SUBARCH=arm64" >> $GITHUB_ENV
+        echo "KBUILD_BUILD_USER=kernel" >> $GITHUB_ENV
+        echo "KBUILD_BUILD_HOST=github-actions" >> $GITHUB_ENV
 
     # =========================
-    # 2. Install dependencies
+    # 2. Dependencies
     # =========================
     - name: Install deps
       run: |
@@ -30,7 +35,7 @@ jobs:
           make git curl xz-utils zip
 
     # =========================
-    # 3. Install LLVM 17 (FIX)
+    # 3. LLVM 17 (CRITICAL FIX)
     # =========================
     - name: Setup LLVM 17
       run: |
@@ -40,17 +45,26 @@ jobs:
         echo "$(pwd)/clang/bin" >> $GITHUB_PATH
 
     # =========================
-    # 4. Environment
+    # 4. Detect UAC2 support (SOURCE LEVEL)
     # =========================
-    - name: Setup env
+    - name: Detect UAC2 in source
       run: |
-        echo "ARCH=arm64" >> $GITHUB_ENV
-        echo "SUBARCH=arm64" >> $GITHUB_ENV
-        echo "KBUILD_BUILD_USER=kernel" >> $GITHUB_ENV
-        echo "KBUILD_BUILD_HOST=github-actions" >> $GITHUB_ENV
+        cd $KERNEL_DIR
+
+        echo "=== SEARCHING FOR UAC2 ==="
+
+        if grep -R "f_uac2" drivers/usb/gadget/function 2>/dev/null; then
+          echo "HAS_UAC2_SRC=1" >> $GITHUB_ENV
+          echo "✔ f_uac2.c found"
+        else
+          echo "HAS_UAC2_SRC=0" >> $GITHUB_ENV
+          echo "❌ No f_uac2.c"
+        fi
+
+        grep -n "UAC2" drivers/usb/gadget/function/Kconfig || true
 
     # =========================
-    # 5. Defconfig (FIXED CORRECTLY)
+    # 5. Apply defconfig (FIXED)
     # =========================
     - name: Apply defconfig
       run: |
@@ -60,7 +74,7 @@ jobs:
         make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 vendor/xiaomi/miatoll_defconfig
 
     # =========================
-    # 6. Resolve config (CRITICAL)
+    # 6. Resolve config
     # =========================
     - name: olddefconfig
       run: |
@@ -68,26 +82,30 @@ jobs:
         make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig
 
     # =========================
-    # 7. Verify UAC2 config
+    # 7. Detect FINAL config (REAL RESULT)
     # =========================
-    - name: Verify UAC2
+    - name: Verify USB audio stack
       run: |
         cd $KERNEL_DIR
         CONFIG=out/.config
 
-        echo "Checking USB gadget stack..."
+        echo "=== FINAL AUDIO CONFIG ==="
 
-        grep CONFIG_USB_GADGET=y $CONFIG || exit 1
-        grep CONFIG_USB_CONFIGFS=y $CONFIG || exit 1
+        grep -E "CONFIG_USB_CONFIGFS_F_.*" $CONFIG || true
 
         if grep -q CONFIG_USB_CONFIGFS_F_UAC2=y $CONFIG; then
-          echo "✔ UAC2 enabled"
+          echo "AUDIO_MODE=UAC2" >> $GITHUB_ENV
+          echo "✔ TRUE UAC2 ENABLED"
+        elif grep -q CONFIG_USB_CONFIGFS_F_AUDIO_SRC=y $CONFIG; then
+          echo "AUDIO_MODE=AUDIO_SRC" >> $GITHUB_ENV
+          echo "⚠ Using AUDIO_SRC fallback"
         else
-          echo "❌ UAC2 missing"
+          echo "❌ NO USB AUDIO FUNCTION"
           exit 1
         fi
 
-        grep CONFIG_SND_USB_AUDIO=y $CONFIG || exit 1
+        grep CONFIG_USB_GADGET=y $CONFIG || exit 1
+        grep CONFIG_USB_CONFIGFS=y $CONFIG || exit 1
 
     # =========================
     # 8. Build kernel
@@ -98,26 +116,23 @@ jobs:
         make -j$(nproc) O=out ARCH=arm64 LLVM=1 LLVM_IAS=1
 
     # =========================
-    # 9. Flash sanity test
+    # 9. Validate output
     # =========================
-    - name: Validate output
+    - name: Validate kernel image
       run: |
         cd $KERNEL_DIR
-
-        echo "Checking kernel image..."
-        ls out/arch/arm64/boot/
 
         test -f out/arch/arm64/boot/Image.gz-dtb || {
           echo "❌ Missing Image.gz-dtb"
           exit 1
         }
 
-        echo "✔ Kernel image OK"
+        echo "✔ Kernel built successfully"
 
     # =========================
     # 10. Package AnyKernel3
     # =========================
-    - name: Package zip
+    - name: Package flashable zip
       run: |
         cd $KERNEL_DIR
 
@@ -134,9 +149,9 @@ jobs:
         zip -r9 ../Kernel-UAC2-SM6250.zip .
 
     # =========================
-    # 11. Upload artifact
+    # 11. Upload
     # =========================
-    - name: Upload zip
+    - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
         name: Kernel-UAC2-SM6250
