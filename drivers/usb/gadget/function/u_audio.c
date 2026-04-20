@@ -1,43 +1,41 @@
 /*
- * u_audio.c -- USB gadget ALSA sound card (LOW LATENCY STABLE BUILD)
+ * u_audio.c -- USB gadget ALSA sound card (NO DRIFT + LOW LATENCY)
  */
 
 #include <linux/module.h>
+#include <linux/usb/gadget.h>
 #include <sound/core.h>
 #include <sound/pcm.h>
 #include <sound/pcm_params.h>
 
 #include "u_audio.h"
 
-#define UAC_RATE 48000
-#define UAC_CHANNELS 2
-#define UAC_SAMPLE_BYTES 2
+/* ===================== AUDIO FORMAT ===================== */
 
-/*
- * TARGET LATENCY PROFILE:
- * ~25ms stable USB audio
- *
- * HARD RULES:
- * - fixed period size
- * - fixed buffer size
- * - no dynamic scaling
- * - no adaptive buffering tricks
- */
+#define UAC_RATE           48000
+#define UAC_CHANNELS       2
+#define UAC_SAMPLE_BYTES   2
+
+/* ===================== LATENCY PROFILE ===================== */
 
 #define PERIOD_SIZE_FRAMES 128
-#define PERIOD_COUNT 10
-
+#define PERIOD_COUNT       8
 #define BUFFER_SIZE_FRAMES (PERIOD_SIZE_FRAMES * PERIOD_COUNT)
 
-/* ===================== PCM STRUCT ===================== */
+/* ===================== STRUCT ===================== */
 
 struct uac_rtd_params {
 	struct snd_pcm_substream *ss;
-	unsigned hw_ptr;
+	unsigned int hw_ptr;
+
 	void *rbuf;
 	spinlock_t lock;
+
 	int error_count;
 	bool stalled;
+
+	/* 🔥 CRITICAL: USB clock sync */
+	unsigned int residue;
 };
 
 /* ===================== ERROR HANDLING ===================== */
@@ -46,7 +44,6 @@ static void uac_handle_error(struct uac_rtd_params *p)
 {
 	p->error_count++;
 
-	/* HARD STABILITY MODE */
 	if (p->error_count > 32)
 		p->stalled = true;
 	else if (p->error_count < 8)
@@ -62,6 +59,26 @@ static void u_audio_complete(struct usb_ep *ep, struct usb_request *req)
 	struct snd_pcm_runtime *runtime;
 	unsigned long flags;
 	unsigned int ptr;
+
+	int frame_bytes = UAC_CHANNELS * UAC_SAMPLE_BYTES;
+
+	/* ===================== USB PACKET TIMING ===================== */
+	/* 48kHz @ HS USB → 8000 microframes/sec */
+
+	int base = UAC_RATE / 8000;          /* = 6 samples */
+	p->residue += UAC_RATE % 8000;       /* keep generic */
+
+	int samples = base;
+
+	if (p->residue >= 8000) {
+		samples++;
+		p->residue -= 8000;
+	}
+
+	req->length = samples * frame_bytes;
+	req->actual = req->length;
+
+	/* ============================================================ */
 
 	if (!substream)
 		goto requeue;
@@ -84,16 +101,15 @@ static void u_audio_complete(struct usb_ep *ep, struct usb_request *req)
 
 	ptr = p->hw_ptr;
 
-	/* SAFE BOUNDARY WRAP */
 	if (ptr >= runtime->dma_bytes)
 		ptr = 0;
 
-	if (ptr + req->actual <= runtime->dma_bytes) {
+	if (ptr + req->length <= runtime->dma_bytes) {
 		memcpy(req->buf,
 		       runtime->dma_area + ptr,
-		       req->actual);
+		       req->length);
 	} else {
-		unsigned split = runtime->dma_bytes - ptr;
+		unsigned int split = runtime->dma_bytes - ptr;
 
 		memcpy(req->buf,
 		       runtime->dma_area + ptr,
@@ -101,15 +117,14 @@ static void u_audio_complete(struct usb_ep *ep, struct usb_request *req)
 
 		memcpy(req->buf + split,
 		       runtime->dma_area,
-		       req->actual - split);
+		       req->length - split);
 	}
 
-	p->hw_ptr = (ptr + req->actual) % runtime->dma_bytes;
+	p->hw_ptr = (ptr + req->length) % runtime->dma_bytes;
 
 	spin_unlock(&p->lock);
 
-	/* PERIOD EVENT */
-	if ((p->hw_ptr % snd_pcm_lib_period_bytes(substream)) < req->actual)
+	if ((p->hw_ptr % snd_pcm_lib_period_bytes(substream)) < req->length)
 		snd_pcm_period_elapsed(substream);
 
 	snd_pcm_stream_unlock_irqrestore(substream, flags);
@@ -119,7 +134,7 @@ requeue:
 		uac_handle_error(p);
 }
 
-/* ===================== PCM HW CONSTRAINTS ===================== */
+/* ===================== PCM HW ===================== */
 
 static struct snd_pcm_hardware uac_pcm_hardware = {
 	.info =
@@ -136,10 +151,11 @@ static struct snd_pcm_hardware uac_pcm_hardware = {
 	.rate_min = UAC_RATE,
 	.rate_max = UAC_RATE,
 
-	/* 🔥 CRITICAL LATENCY SETTINGS */
+	.period_bytes_min =
+		PERIOD_SIZE_FRAMES * UAC_CHANNELS * UAC_SAMPLE_BYTES,
 
-	.period_bytes_min = PERIOD_SIZE_FRAMES * UAC_CHANNELS * UAC_SAMPLE_BYTES,
-	.period_bytes_max = PERIOD_SIZE_FRAMES * UAC_CHANNELS * UAC_SAMPLE_BYTES,
+	.period_bytes_max =
+		PERIOD_SIZE_FRAMES * UAC_CHANNELS * UAC_SAMPLE_BYTES,
 
 	.periods_min = PERIOD_COUNT,
 	.periods_max = PERIOD_COUNT,
@@ -148,7 +164,7 @@ static struct snd_pcm_hardware uac_pcm_hardware = {
 		BUFFER_SIZE_FRAMES * UAC_CHANNELS * UAC_SAMPLE_BYTES,
 };
 
-/* ===================== HW PARAM SETUP ===================== */
+/* ===================== OPEN ===================== */
 
 static int uac_pcm_open(struct snd_pcm_substream *substream)
 {
@@ -156,7 +172,7 @@ static int uac_pcm_open(struct snd_pcm_substream *substream)
 
 	runtime->hw = uac_pcm_hardware;
 
-	/* HARD LOCK: prevents ALSA from "helping" (bad for latency) */
+	/* lock ALSA into exact timing */
 	snd_pcm_hw_constraint_integer(runtime, SNDRV_PCM_HW_PARAM_PERIODS);
 
 	return 0;
@@ -177,6 +193,7 @@ static int uac_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 		p->ss = substream;
 		p->stalled = false;
 		p->error_count = 0;
+		p->residue = 0;
 		break;
 
 	case SNDRV_PCM_TRIGGER_STOP:
@@ -186,10 +203,11 @@ static int uac_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 	}
 
 	spin_unlock_irqrestore(&p->lock, flags);
+
 	return 0;
 }
 
 /* ===================== MODULE ===================== */
 
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("Stable low-latency USB Audio Gadget");
+MODULE_DESCRIPTION("USB Audio Gadget (Low Latency + No Drift)");
