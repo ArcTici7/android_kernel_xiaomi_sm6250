@@ -1,30 +1,110 @@
-name: miatoll-kernel
+name: Android Kernel Build (UAC2 + AnyKernel3)
 
 on:
   workflow_dispatch:
+  push:
+    branches: [ lineage-21 ]
 
 jobs:
   build:
     runs-on: ubuntu-22.04
 
     steps:
-    - name: Checkout kernel
-      uses: actions/checkout@v4
+      # =========================
+      # 1. Checkout source
+      # =========================
+      - name: Checkout Kernel Source
+        uses: actions/checkout@v4
 
-    - name: Install dependencies
-      run: |
-        sudo apt update
-        sudo apt install -y bc bison flex libssl-dev make git python3 clang lld
+      # =========================
+      # 2. Dependencies
+      # =========================
+      - name: Install build dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            git curl wget zip unzip bc \
+            build-essential libssl-dev \
+            flex bison \
+            python3 \
+            clang lld llvm \
+            gcc-aarch64-linux-gnu
 
-    - name: Clone clang toolchain
-      run: |
-        git clone --depth=1 https://github.com/llvm/llvm-project clang
+      # =========================
+      # 3. Environment setup
+      # =========================
+      - name: Set environment variables
+        run: |
+          echo "ARCH=arm64" >> $GITHUB_ENV
+          echo "SUBARCH=arm64" >> $GITHUB_ENV
+          echo "KBUILD_BUILD_USER=uac2_builder" >> $GITHUB_ENV
+          echo "KBUILD_BUILD_HOST=github-actions" >> $GITHUB_ENV
 
-    - name: Build kernel
-      run: |
-        export ARCH=arm64
-        export SUBARCH=arm64
-        export PATH=$PWD/clang/bin:$PATH
+      # =========================
+      # 4. Prepare output dir
+      # =========================
+      - name: Prepare build directory
+        run: |
+          mkdir -p out
 
-        make O=out ARCH=arm64 miatoll_defconfig
-        make -j$(nproc) O=out ARCH=arm64 CC=clang LD=ld.lld
+      # =========================
+      # 5. Apply defconfig
+      # (your miatoll defconfig)
+      # =========================
+      - name: Apply defconfig
+        run: |
+          make O=out ARCH=arm64 miatoll_defconfig
+
+      # =========================
+      # 6. Build kernel
+      # =========================
+      - name: Build kernel
+        run: |
+          make -j$(nproc) O=out ARCH=arm64 \
+            CC=clang \
+            LD=ld.lld \
+            LLVM=1 \
+            LLVM_IAS=1
+
+      # =========================
+      # 7. Build modules
+      # =========================
+      - name: Build modules
+        run: |
+          make -j$(nproc) O=out ARCH=arm64 modules
+
+      # =========================
+      # 8. AnyKernel3 packaging
+      # =========================
+      - name: Clone AnyKernel3
+        run: |
+          git clone https://github.com/osm0sis/AnyKernel3.git anykernel
+
+      - name: Copy kernel image
+        run: |
+          if [ -f out/arch/arm64/boot/Image ]; then
+            cp out/arch/arm64/boot/Image anykernel/
+          else
+            cp out/arch/arm64/boot/Image.gz-dtb anykernel/
+          fi
+
+      - name: Copy modules (if any)
+        run: |
+          find out -name "*.ko" -exec cp {} anykernel/modules/ \; || true
+
+      # =========================
+      # 9. Create flashable zip
+      # =========================
+      - name: Create flashable ZIP
+        run: |
+          cd anykernel
+          zip -r9 ../UAC2-Kernel-Flashable.zip ./*
+
+      # =========================
+      # 10. Upload artifact
+      # =========================
+      - name: Upload kernel zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: UAC2-Kernel-Zip
+          path: UAC2-Kernel-Flashable.zip
