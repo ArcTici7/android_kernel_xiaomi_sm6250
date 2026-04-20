@@ -1,142 +1,48 @@
 /*
- * u_audio.c -- USB gadget ALSA sound card (NO DRIFT + LOW LATENCY)
+ * u_audio.c -- USB Gadget ALSA Audio (ZERO-COPY DMA PIPELINE)
+ *
+ * Design goals:
+ *  - NO memcpy in ISO data path
+ *  - ALSA DMA buffer == USB transfer source
+ *  - fixed 48kHz / 144-frame (3ms) cadence
+ *  - deterministic ring buffer progression
  */
 
 #include <linux/module.h>
+#include <linux/spinlock.h>
 #include <linux/usb/gadget.h>
+
 #include <sound/core.h>
 #include <sound/pcm.h>
 #include <sound/pcm_params.h>
 
-#include "u_audio.h"
+#define RATE            48000
+#define CHANNELS        2
+#define SAMPLE_BYTES    2
 
-/* ===================== AUDIO FORMAT ===================== */
+/* 3ms USB-aligned quantum */
+#define PERIOD_FRAMES   144
+#define PERIOD_BYTES    (PERIOD_FRAMES * CHANNELS * SAMPLE_BYTES)
 
-#define UAC_RATE           48000
-#define UAC_CHANNELS       2
-#define UAC_SAMPLE_BYTES   2
+#define PERIODS         10
+#define BUFFER_FRAMES   (PERIOD_FRAMES * PERIODS)
+#define BUFFER_BYTES    (BUFFER_FRAMES * CHANNELS * SAMPLE_BYTES)
 
-/* ===================== LATENCY PROFILE ===================== */
+/* ===================== STATE ===================== */
 
-#define PERIOD_SIZE_FRAMES 128
-#define PERIOD_COUNT       8
-#define BUFFER_SIZE_FRAMES (PERIOD_SIZE_FRAMES * PERIOD_COUNT)
-
-/* ===================== STRUCT ===================== */
-
-struct uac_rtd_params {
+struct uac_rtd {
 	struct snd_pcm_substream *ss;
-	unsigned int hw_ptr;
+	struct snd_pcm_runtime *runtime;
 
-	void *rbuf;
+	unsigned int hw_ptr;
 	spinlock_t lock;
 
-	int error_count;
-	bool stalled;
-
-	/* 🔥 CRITICAL: USB clock sync */
-	unsigned int residue;
+	bool running;
 };
 
-/* ===================== ERROR HANDLING ===================== */
+/* ===================== PCM HARDWARE ===================== */
 
-static void uac_handle_error(struct uac_rtd_params *p)
-{
-	p->error_count++;
-
-	if (p->error_count > 32)
-		p->stalled = true;
-	else if (p->error_count < 8)
-		p->stalled = false;
-}
-
-/* ===================== ISO CALLBACK ===================== */
-
-static void u_audio_complete(struct usb_ep *ep, struct usb_request *req)
-{
-	struct uac_rtd_params *p = req->context;
-	struct snd_pcm_substream *substream = p->ss;
-	struct snd_pcm_runtime *runtime;
-	unsigned long flags;
-	unsigned int ptr;
-
-	int frame_bytes = UAC_CHANNELS * UAC_SAMPLE_BYTES;
-
-	/* ===================== USB PACKET TIMING ===================== */
-	/* 48kHz @ HS USB → 8000 microframes/sec */
-
-	int base = UAC_RATE / 8000;          /* = 6 samples */
-	p->residue += UAC_RATE % 8000;       /* keep generic */
-
-	int samples = base;
-
-	if (p->residue >= 8000) {
-		samples++;
-		p->residue -= 8000;
-	}
-
-	req->length = samples * frame_bytes;
-	req->actual = req->length;
-
-	/* ============================================================ */
-
-	if (!substream)
-		goto requeue;
-
-	snd_pcm_stream_lock_irqsave(substream, flags);
-	runtime = substream->runtime;
-
-	if (!runtime || !snd_pcm_running(substream)) {
-		snd_pcm_stream_unlock_irqrestore(substream, flags);
-		goto requeue;
-	}
-
-	spin_lock(&p->lock);
-
-	if (p->stalled) {
-		spin_unlock(&p->lock);
-		snd_pcm_stream_unlock_irqrestore(substream, flags);
-		goto requeue;
-	}
-
-	ptr = p->hw_ptr;
-
-	if (ptr >= runtime->dma_bytes)
-		ptr = 0;
-
-	if (ptr + req->length <= runtime->dma_bytes) {
-		memcpy(req->buf,
-		       runtime->dma_area + ptr,
-		       req->length);
-	} else {
-		unsigned int split = runtime->dma_bytes - ptr;
-
-		memcpy(req->buf,
-		       runtime->dma_area + ptr,
-		       split);
-
-		memcpy(req->buf + split,
-		       runtime->dma_area,
-		       req->length - split);
-	}
-
-	p->hw_ptr = (ptr + req->length) % runtime->dma_bytes;
-
-	spin_unlock(&p->lock);
-
-	if ((p->hw_ptr % snd_pcm_lib_period_bytes(substream)) < req->length)
-		snd_pcm_period_elapsed(substream);
-
-	snd_pcm_stream_unlock_irqrestore(substream, flags);
-
-requeue:
-	if (usb_ep_queue(ep, req, GFP_ATOMIC))
-		uac_handle_error(p);
-}
-
-/* ===================== PCM HW ===================== */
-
-static struct snd_pcm_hardware uac_pcm_hardware = {
+static struct snd_pcm_hardware uac_hw = {
 	.info =
 		SNDRV_PCM_INFO_INTERLEAVED |
 		SNDRV_PCM_INFO_BLOCK_TRANSFER |
@@ -145,69 +51,135 @@ static struct snd_pcm_hardware uac_pcm_hardware = {
 
 	.formats = SNDRV_PCM_FMTBIT_S16_LE,
 
-	.channels_min = UAC_CHANNELS,
-	.channels_max = UAC_CHANNELS,
+	.channels_min = CHANNELS,
+	.channels_max = CHANNELS,
 
-	.rate_min = UAC_RATE,
-	.rate_max = UAC_RATE,
+	.rate_min = RATE,
+	.rate_max = RATE,
 
-	.period_bytes_min =
-		PERIOD_SIZE_FRAMES * UAC_CHANNELS * UAC_SAMPLE_BYTES,
+	.period_bytes_min = PERIOD_BYTES,
+	.period_bytes_max = PERIOD_BYTES,
 
-	.period_bytes_max =
-		PERIOD_SIZE_FRAMES * UAC_CHANNELS * UAC_SAMPLE_BYTES,
+	.periods_min = PERIODS,
+	.periods_max = PERIODS,
 
-	.periods_min = PERIOD_COUNT,
-	.periods_max = PERIOD_COUNT,
-
-	.buffer_bytes_max =
-		BUFFER_SIZE_FRAMES * UAC_CHANNELS * UAC_SAMPLE_BYTES,
+	.buffer_bytes_max = BUFFER_BYTES,
 };
 
-/* ===================== OPEN ===================== */
+/* ===================== PCM OPEN ===================== */
 
-static int uac_pcm_open(struct snd_pcm_substream *substream)
+static int uac_open(struct snd_pcm_substream *substream)
 {
-	struct snd_pcm_runtime *runtime = substream->runtime;
+	struct snd_pcm_runtime *rt = substream->runtime;
 
-	runtime->hw = uac_pcm_hardware;
+	rt->hw = uac_hw;
 
-	/* lock ALSA into exact timing */
-	snd_pcm_hw_constraint_integer(runtime, SNDRV_PCM_HW_PARAM_PERIODS);
+	/* lock deterministic period sizing */
+	snd_pcm_hw_constraint_minmax(
+		rt,
+		SNDRV_PCM_HW_PARAM_PERIOD_SIZE,
+		PERIOD_FRAMES,
+		PERIOD_FRAMES
+	);
+
+	snd_pcm_hw_constraint_minmax(
+		rt,
+		SNDRV_PCM_HW_PARAM_PERIODS,
+		PERIODS,
+		PERIODS
+	);
+
+	/*
+	 * ZERO COPY REQUIREMENT:
+	 * ALSA DMA buffer is directly used by USB
+	 */
+	snd_pcm_lib_preallocate_pages_for_all(
+		substream,
+		SNDRV_DMA_TYPE_CONTINUOUS,
+		snd_dma_continuous_data(GFP_KERNEL),
+		BUFFER_BYTES,
+		BUFFER_BYTES
+	);
 
 	return 0;
 }
 
 /* ===================== TRIGGER ===================== */
 
-static int uac_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
+static int uac_trigger(struct snd_pcm_substream *substream, int cmd)
 {
-	struct uac_rtd_params *p = snd_pcm_substream_chip(substream);
+	struct uac_rtd *rtd = substream->private_data;
 	unsigned long flags;
 
-	spin_lock_irqsave(&p->lock, flags);
+	spin_lock_irqsave(&rtd->lock, flags);
 
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
-	case SNDRV_PCM_TRIGGER_RESUME:
-		p->ss = substream;
-		p->stalled = false;
-		p->error_count = 0;
-		p->residue = 0;
+		rtd->ss = substream;
+		rtd->runtime = substream->runtime;
+		rtd->hw_ptr = 0;
+		rtd->running = true;
 		break;
 
 	case SNDRV_PCM_TRIGGER_STOP:
-	case SNDRV_PCM_TRIGGER_SUSPEND:
-		p->ss = NULL;
+		rtd->running = false;
+		rtd->ss = NULL;
+		rtd->runtime = NULL;
 		break;
 	}
 
-	spin_unlock_irqrestore(&p->lock, flags);
-
+	spin_unlock_irqrestore(&rtd->lock, flags);
 	return 0;
+}
+
+/* ===================== USB ISO CALLBACK ===================== */
+
+static void uac_iso_complete(struct usb_ep *ep, struct usb_request *req)
+{
+	struct uac_rtd *rtd = req->context;
+	struct snd_pcm_runtime *rt;
+	struct snd_pcm_substream *ss;
+	unsigned long flags;
+	unsigned int ptr;
+
+	if (!rtd || !rtd->ss)
+		goto requeue;
+
+	ss = rtd->ss;
+	rt = rtd->runtime;
+
+	if (!rt || !rtd->running)
+		goto requeue;
+
+	snd_pcm_stream_lock_irqsave(ss, flags);
+	spin_lock(&rtd->lock);
+
+	ptr = rtd->hw_ptr;
+
+	if (ptr >= BUFFER_BYTES)
+		ptr = 0;
+
+	/*
+	 * 🔥 ZERO COPY CORE:
+	 * USB DMA reads directly from ALSA DMA buffer
+	 */
+	req->buf = rt->dma_area + ptr;
+	req->length = PERIOD_BYTES;
+
+	rtd->hw_ptr = ptr + PERIOD_BYTES;
+
+	/* notify ALSA every period */
+	if ((rtd->hw_ptr % PERIOD_BYTES) == 0)
+		snd_pcm_period_elapsed(ss);
+
+	spin_unlock(&rtd->lock);
+	snd_pcm_stream_unlock_irqrestore(ss, flags);
+
+requeue:
+	usb_ep_queue(ep, req, GFP_ATOMIC);
 }
 
 /* ===================== MODULE ===================== */
 
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("USB Audio Gadget (Low Latency + No Drift)");
+MODULE_DESCRIPTION("UAC2 ZERO-COPY USB Audio Gadget (DMA Direct Path)");
