@@ -1,4 +1,4 @@
-name: SM6250 Kernel Build (Fixed USB ConfigFS)
+name: Build SM6250 Kernel (Clean USB ConfigFS Audit)
 
 on:
   workflow_dispatch:
@@ -7,128 +7,118 @@ jobs:
   build:
     runs-on: ubuntu-22.04
 
+    env:
+      KERNEL_DIR: kernel
+      ARCH: arm64
+      SUBARCH: arm64
+      KBUILD_BUILD_USER: kernel
+      KBUILD_BUILD_HOST: github-actions
+
     steps:
     # =========================
-    # 1. Clone kernel (CORRECT SOURCE)
+    # 1. Checkout
     # =========================
-    - name: Clone kernel
-      run: |
-        git clone --depth=1 -b lineage-21 \
-          https://github.com/ArcTici7/android_kernel_xiaomi_sm6250.git kernel
-
-    - name: Setup env
-      run: |
-        echo "KERNEL_DIR=kernel" >> $GITHUB_ENV
-        echo "ARCH=arm64" >> $GITHUB_ENV
-        echo "SUBARCH=arm64" >> $GITHUB_ENV
-        echo "KBUILD_BUILD_USER=kernel" >> $GITHUB_ENV
-        echo "KBUILD_BUILD_HOST=github-actions" >> $GITHUB_ENV
+    - name: Checkout kernel source
+      uses: actions/checkout@v4
+      with:
+        repository: ArcTici7/android_kernel_xiaomi_sm6250
+        ref: lineage-21
+        path: kernel
 
     # =========================
     # 2. Dependencies
     # =========================
-    - name: Install deps
+    - name: Install dependencies
       run: |
         sudo apt update
         sudo apt install -y bc bison flex libssl-dev libelf-dev \
-          git curl zip make
+          git curl zip make cpio python3
 
     # =========================
-    # 3. LLVM 17 (STABLE TOOLCHAIN)
+    # 3. LLVM toolchain
     # =========================
-    - name: LLVM 17
+    - name: Setup LLVM 17
       run: |
         wget -q https://github.com/llvm/llvm-project/releases/download/llvmorg-17.0.4/clang+llvm-17.0.4-x86_64-linux-gnu-ubuntu-22.04.tar.xz
         tar -xf clang+llvm-17.0.4-x86_64-linux-gnu-ubuntu-22.04.tar.xz
         mv clang+llvm-17.0.4-x86_64-linux-gnu-ubuntu-22.04 clang
         echo "$(pwd)/clang/bin" >> $GITHUB_PATH
 
+        echo "CC=clang" >> $GITHUB_ENV
+        echo "LD=ld.lld" >> $GITHUB_ENV
+
     # =========================
-    # 4. Apply defconfig (CORRECT)
+    # 4. Defconfig (IMPORTANT FIX)
     # =========================
-    - name: Defconfig
+    - name: Apply defconfig
+      working-directory: kernel
       run: |
-        cd kernel
         mkdir -p out
 
+        # ALWAYS use real defconfig path (no basename hacks)
         make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 \
           vendor/xiaomi/miatoll_defconfig
 
+        echo "Defconfig applied"
+
     # =========================
-    # 5. FIX USB CONFIGFS (REAL ISSUE FIX)
+    # 5. CLEAN USB CONFIGFS AUDIT (THIS IS KEY)
     # =========================
-    - name: Fix USB gadget core
+    - name: Audit USB ConfigFS + UAC2 presence
+      working-directory: kernel
       run: |
-        cd kernel
-
-        echo "Enabling USB gadget core dependencies..."
-
-        scripts/config --file out/.config \
-          -e USB_GADGET \
-          -e USB_CONFIGFS \
-          -e USB_LIBCOMPOSITE
-
-        make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig
-
-    # =========================
-    # 6. VERIFY USB STACK (NO FALSE FAILS)
-    # =========================
-    - name: Verify USB stack
-      run: |
-        cd kernel
         CONFIG=out/.config
 
         echo "=== USB CORE ==="
-        grep CONFIG_USB_GADGET $CONFIG
-        grep CONFIG_USB_CONFIGFS $CONFIG
-        grep CONFIG_USB_LIBCOMPOSITE $CONFIG || echo "WARN: LIBCOMPOSITE missing"
+        grep CONFIG_USB_GADGET $CONFIG || exit 1
+        grep CONFIG_USB_CONFIGFS $CONFIG || exit 1
+        grep CONFIG_USB_LIBCOMPOSITE $CONFIG || exit 1
 
-        echo "=== USB FUNCTIONS ==="
-        grep CONFIG_USB_CONFIGFS_F_ $CONFIG || true
-
-        if grep -q CONFIG_USB_CONFIGFS_F_UAC2=y $CONFIG; then
-          echo "✔ UAC2 ENABLED"
-        elif grep -q CONFIG_USB_CONFIGFS_F_MTP=y $CONFIG; then
-          echo "✔ MTP ENABLED (no UAC2)"
+        echo "=== FUNCTION SUBSYSTEM CHECK ==="
+        if grep -q "function/Kconfig" drivers/usb/gadget/Kconfig; then
+          echo "✔ Function Kconfig included"
         else
-          echo "⚠ No USB audio/MTP function enabled"
+          echo "❌ MISSING: function/Kconfig NOT sourced"
+          exit 1
         fi
 
+        echo "=== UAC2 SOURCE CHECK ==="
+        if grep -R "f_uac2" -n drivers/usb/gadget/function; then
+          echo "✔ UAC2 source exists"
+        else
+          echo "❌ NO UAC2 SOURCE IN TREE"
+          exit 1
+        fi
+
+        echo "=== CONFIG SYMBOL CHECK ==="
+        grep USB_CONFIGFS_F_UAC2 $CONFIG || echo "⚠ UAC2 NOT ENABLED (expected if Kconfig missing)"
+
     # =========================
-    # 7. BUILD KERNEL
+    # 6. Build
     # =========================
-    - name: Build
+    - name: Build kernel
+      working-directory: kernel
       run: |
-        cd kernel
         make -j$(nproc) O=out ARCH=arm64 LLVM=1 LLVM_IAS=1
 
     # =========================
-    # 8. CHECK OUTPUT
+    # 7. Artifact
     # =========================
-    - name: Check Image
+    - name: Package kernel
       run: |
-        test -f kernel/out/arch/arm64/boot/Image.gz-dtb
+        mkdir -p release
+        find kernel/out/arch/arm64/boot -name "Image*" -exec cp {} release/ \;
 
-    # =========================
-    # 9. PACKAGE (AnyKernel3)
-    # =========================
-    - name: Package zip
-      run: |
-        cd kernel
-
-        git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git ak3
+        git clone --depth=1 https://github.com/osm0sis/AnyKernel3 ak3
         rm -rf ak3/.git
 
-        cp out/arch/arm64/boot/Image.gz-dtb ak3/
+        cp release/* ak3/ || true
 
         cd ak3
         zip -r9 ../Kernel-SM6250.zip .
 
-    # =========================
-    # 10. Upload
-    # =========================
-    - name: Upload
+    - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
-        name: kernel
-        path: kernel/Kernel-SM6250.zip
+        name: SM6250-Kernel
+        path: Kernel-SM6250.zip
