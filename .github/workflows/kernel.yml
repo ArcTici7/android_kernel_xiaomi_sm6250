@@ -1,1 +1,59 @@
+name: Kernel Build (USB UAC2 Safe)
 
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y bc bison flex libssl-dev make gcc git python3
+
+      - name: Prepare build directory
+        run: |
+          mkdir -p out
+
+      - name: Generate defconfig
+        run: |
+          make O=out ARCH=arm64 miatoll_defconfig
+
+      - name: Merge config safely
+        run: |
+          scripts/kconfig/merge_config.sh \
+            -m out/.config \
+            arch/arm64/configs/vendor/xiaomi/miatoll_defconfig
+
+          make O=out ARCH=arm64 olddefconfig
+
+      - name: Config verification
+        run: |
+          CONFIG=out/.config
+
+          echo "USB CHECK"
+          grep CONFIG_USB_GADGET= $CONFIG
+          grep CONFIG_USB_CONFIGFS= $CONFIG
+          grep CONFIG_USB_LIBCOMPOSITE= $CONFIG
+
+          echo "AUDIO CHECK"
+          grep CONFIG_SND= $CONFIG
+          grep CONFIG_SND_PCM= $CONFIG || true
+
+          echo "UAC2 CHECK"
+          grep CONFIG_USB_CONFIGFS_F_UAC2= $CONFIG || {
+            echo "UAC2 NOT ENABLED"
+            exit 1
+          }
+
+          echo "OK BUILD READY"
+
+      - name: Build kernel
+        run: |
+          make -j$(nproc) O=out ARCH=arm64
